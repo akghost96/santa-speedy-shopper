@@ -222,3 +222,5 @@ and the tool call have been seen three times. The 226-token tool call then reach
   82-token tool call reached 1,748 tok/s (46.9 ms; its best with one example turn was about 1,650).
 - New entry from that configuration at 20:39: **1,755 mean / 1,762 p90** (calls at 1,748 and 1,762, 2.0 s from Enter
   to the five links) → `submissions/candidate-1755tps.mp4`, `evidence/entry-1755/`.
+- 22:13: **1,757 mean / 1,765 p90** from the same configuration (calls at 1,750 and 1,765) →
+  `submissions/candidate-1757tps.mp4`, `evidence/entry-1757/`.

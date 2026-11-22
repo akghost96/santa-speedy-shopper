@@ -1,0 +1,19 @@
+{
+  "ready": 1795378406704.2,
+  "enter": 1795378412657,
+  "finish": 1795378414715.2,
+  "links": [
+    "https://ledergames.com/products/root-a-game-of-woodland-might-and-right",
+    "https://www.naturallife.com/products/double-sided-cozy-throw-blanket-patchwork-be-happy",
+    "https://goosecreek.com/products/maple-butter-large-3-wick-candle",
+    "https://www.coffeebeanery.com/products/the-right-roast-sampler-gift-basket",
+    "https://bark.co/products/pickle-stickle"
+  ],
+  "trusted": true,
+  "score": "1,757 tok/s mean · 1,765 p90 (server)",
+  "path": "/chat/main/bounty-short-px1795378404w1t75",
+  "captureStart": 1795378405749,
+  "stoppedAt": 1795378418827,
+  "sessionKey": "agent:main:bounty-short-px1795378404w1t75",
+  "prompt": "Find five Christmas gifts from US retailers. Give me five direct product links."
+}

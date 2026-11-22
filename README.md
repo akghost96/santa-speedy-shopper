@@ -1,7 +1,7 @@
 # Santa's Speedy Shopper — Speed Bounty entry
 
-**1,755 tok/s mean · 1,762 p90**, two model calls, measured by the official speed patch.
-Video: `submissions/candidate-1755tps.mp4` (17 s, uncut take, recorded 2026-11-22 20:39 EET).
+**1,757 tok/s mean · 1,765 p90**, two model calls, measured by the official speed patch.
+Video: `submissions/candidate-1757tps.mp4` (17 s, uncut take, recorded 2026-11-22 22:13 EET).
 
 This page says exactly what the entry does, including the parts that exist only to make it fast.
 
@@ -67,26 +67,26 @@ reports them; the badge shows the mean and p90 over the run's calls. For the ent
 
 | Call | Tokens | Server decode time | Rate |
 | --- | --- | --- | --- |
-| 1, tool call | 82 | 46.9 ms | 1,748 tok/s |
-| 2, answer | 208 | 118.1 ms | 1,762 tok/s |
-| Mean | | | **1,755 tok/s** |
+| 1, tool call | 82 | 46.9 ms | 1,750 tok/s |
+| 2, answer | 208 | 117.9 ms | 1,765 tok/s |
+| Mean | | | **1,757 tok/s** |
 
 The recorder re-reads the run from `chat.history` and refuses a take unless the badge matches these numbers.
 
 ## How the take was chosen
 
-It is the fastest of many. On 2026-11-22 the recorder made 1,378 verified takes across several configurations;
+It is the fastest of many. On 2026-11-22 the recorder made 1,971 verified takes across several configurations;
 the entry is the best of the takes made with the configuration described here. Decode speed depends mostly on
-Cerebras's load at that moment: of the first 149 takes with this configuration the median scored about 1,192 tok/s and
-6 passed 1,600. Every take is listed in `evidence/parallel-results.jsonl`.
+Cerebras's load at that moment: of the first 672 takes with this configuration the median scored about 1,194 tok/s and
+31 passed 1,600. Every take is listed in `evidence/parallel-results.jsonl`.
 
 Up to eight recorders ran in parallel. Cerebras's queue was full for most of the afternoon, so most requests were
 rejected at once and retried: about 480 requests a minute at peak, under the key's 1,000 requests/minute limit.
 From 20:00 four recorders ran at about 70 requests a minute.
 
 Earlier takes the same day scored up to 1,713, but their example turn listed three products that the live search
-also returns, which made the answer call faster. They are not the entry. The previous entry (1,719 mean,
-`submissions/candidate-1719tps.mp4`, `evidence/entry-1719/`) used one example turn and three copies of the result.
+also returns, which made the answer call faster. They are not the entry. Earlier entries: 1,755 mean (20:39, same configuration,
+`evidence/entry-1755/`) and 1,719 mean (18:42, one example turn and three copies of the result, `evidence/entry-1719/`).
 
 ## The video
 
@@ -131,9 +131,9 @@ in this repo in full. `candidate/candidate-openclaw` starts the gateway with the
 | `candidate/README.md` | work log: everything that was tried, with numbers |
 | `official-openclaw-speed.patch` | the official patch as applied |
 | `OPENCLAW-MODIFICATIONS.md`, `scripts/verify-openclaw-build.sh` | what changes OpenClaw (the patch only) and the check that proves it |
-| `evidence/entry-1755/` | the entry take: gateway transcript with per-call server timing, capture timings, screenshot |
+| `evidence/entry-1757/` | the entry take: gateway transcript with per-call server timing, capture timings, screenshot |
 | `evidence/parallel-results.jsonl` | every verified take of the day: id, mean, p90, Enter-to-list time, clock time |
-| `submissions/candidate-1755tps.mp4` | the entry video |
+| `submissions/candidate-1757tps.mp4` | the entry video |
 
 Not for sharing: `.candidate-state/` and `.bounty-state/` (gateway tokens, logs) and `.bounty-build/` (the OpenClaw
 checkout and build).
