@@ -74,10 +74,10 @@ The recorder re-reads the run from `chat.history` and refuses a take unless the 
 
 ## How the take was chosen
 
-It is the fastest of many. On 2026-11-22 the recorder made about 800 verified takes across several configurations;
-the entry is the best of the takes made with the configuration described here. Decode speed depends mostly on
-Cerebras's load at that moment: the median take with this configuration scored about 1,180 tok/s, and three of the
-first 52 passed 1,600.
+It is the fastest of many. On 2026-11-22 the recorder made more than 1,000 verified takes across several
+configurations; the entry is the best of the takes made with the configuration described here. Decode speed depends
+mostly on Cerebras's load at that moment: of the first 264 takes with this configuration the median scored about
+1,180 tok/s and 4 passed 1,600. Every take is listed in `evidence/parallel-results.jsonl`.
 
 Up to eight recorders ran in parallel. Cerebras's queue was full for most of the afternoon, so most requests were
 rejected at once and retried: about 480 requests a minute at peak, under the key's 1,000 requests/minute limit.
