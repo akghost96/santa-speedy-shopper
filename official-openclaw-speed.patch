@@ -1,0 +1,1079 @@
+From e42dc98e01f6bfd235f81470da3597a8b48f2760 Mon Sep 17 00:00:00 2001
+From: OpenClaw Hackathon <hackathon@example.com>
+Date: Sat, 21 Nov 2026 05:08:43 +0000
+Subject: [PATCH 1/2] feat(chat): show Cerebras's decode speed as mean tok/s
+ per response and session
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Cerebras ends every chat-completions stream with `time_info` next to
+`usage`. The completions transport now keeps `time_info.completion_time`
+and `usage.completion_tokens` on the assistant message as
+`serverGeneration`. Their ratio is the call's decode speed on the server,
+without queueing, prefill, network or tool time.
+
+The Control UI shows "<mean> tok/s mean · <p90> p90 (server)", where
+the mean and the nearest-rank p90 are taken over per-call rates:
+- on each response, over its model calls;
+- next to the composer, over the visible session;
+- in the working indicator while a run continues, over the calls that
+  have finished so far, fed by a `generation` agent event that the Gateway
+  emits with each finished call's server timing.
+Calls without server timing are left out. Nothing is estimated on the
+client.
+
+---
+ .../openai-completions-stream.test.ts         |  43 ++++++
+ .../transports/openai-completions-stream.ts   |   5 +
+ .../src/transports/openai-transport-shared.ts |  22 +++
+ packages/llm-core/src/types.ts                |  14 ++
+ ...scribe.handlers.messages.lifecycle.test.ts |  31 ++++
+ ...t-subscribe.handlers.messages.lifecycle.ts |   2 +
+ ...gent-subscribe.handlers.messages.update.ts |  19 +++
+ .../i18n/locales/en-chat-message-metadata.ts  |   5 +
+ .../pages/chat/chat-generation-speed.test.ts  |  54 +++++++
+ ui/src/pages/chat/chat-generation-speed.ts    | 134 ++++++++++++++++++
+ ui/src/pages/chat/chat-pane-render.ts         |   1 +
+ ui/src/pages/chat/chat-state-contract.ts      |   2 +
+ ui/src/pages/chat/chat-state-page.ts          |   3 +-
+ .../chat/components/chat-agent-run-frame.ts   |   4 +
+ .../chat/components/chat-composer-view.ts     |   5 +-
+ .../components/chat-message-group-options.ts  |   3 +
+ .../chat/components/chat-message-group.ts     |   6 +
+ .../chat/components/chat-message-stream.ts    |   3 +
+ .../components/chat-thread-interactions.ts    |   8 +-
+ .../components/chat-transcript-projection.ts  |  10 +-
+ .../chat/components/chat-working-indicator.ts |   4 +
+ ui/src/pages/chat/tool-stream-contract.ts     |  11 ++
+ ui/src/pages/chat/tool-stream.ts              |  47 ++++++
+ .../pages/chat/tool-stream.usage.node.test.ts |  31 ++++
+ ui/src/styles/chat/grouped.css                |  24 ++++
+ 25 files changed, 486 insertions(+), 5 deletions(-)
+ create mode 100644 ui/src/pages/chat/chat-generation-speed.test.ts
+ create mode 100644 ui/src/pages/chat/chat-generation-speed.ts
+
+diff --git a/packages/ai/src/transports/openai-completions-stream.test.ts b/packages/ai/src/transports/openai-completions-stream.test.ts
+index e3da92cca64..dbea3ed0c20 100644
+--- a/packages/ai/src/transports/openai-completions-stream.test.ts
++++ b/packages/ai/src/transports/openai-completions-stream.test.ts
+@@ -581,6 +581,49 @@ describe("openai completions stream", () => {
+     });
+   });
+ 
++  it("keeps the server's decode timing from the final chunk", async () => {
++    const model = makeCompletionsModel({
++      id: "cerebras-test",
++      name: "Cerebras",
++      provider: "cerebras",
++      baseUrl: "https://api.example.test/v1",
++    });
++    const output = createAssistantOutput(model);
++    const stream: { push(event: unknown): void } = { push() {} };
++
++    async function* mockStream() {
++      yield makeCompletionsChunk({ role: "assistant" as const, content: "ok" }, "stop" as const);
++      yield makeCompletionsChunk({}, null, {
++        choices: [],
++        usage: { prompt_tokens: 160, completion_tokens: 899, total_tokens: 1059 },
++        time_info: { completion_time: 0.7375, prompt_time: 0.012, queue_time: 0.001 },
++      });
++    }
++
++    await processCompletionsStream(mockStream(), output, model, stream);
++
++    expect(output.serverGeneration).toEqual({ completionMs: 737.5, outputTokens: 899 });
++    expect(output.usage.output).toBe(899);
++  });
++
++  it("reports no server metrics for servers that send only usage", async () => {
++    const model = makeCompletionsModel({ id: "glm-5", name: "GLM-5", provider: "vllm" });
++    const output = createAssistantOutput(model);
++    const stream: { push(event: unknown): void } = { push() {} };
++
++    async function* mockStream() {
++      yield makeCompletionsChunk({ role: "assistant" as const, content: "ok" }, "stop" as const);
++      yield makeCompletionsChunk({}, null, {
++        choices: [],
++        usage: { prompt_tokens: 8, completion_tokens: 10, total_tokens: 18 },
++      });
++    }
++
++    await processCompletionsStream(mockStream(), output, model, stream);
++
++    expect(output.serverGeneration).toBeUndefined();
++  });
++
+   it.each(["reasoning before text", "reasoning after text"] as const)(
+     "handles %s usage chunks",
+     async (kind) => {
+diff --git a/packages/ai/src/transports/openai-completions-stream.ts b/packages/ai/src/transports/openai-completions-stream.ts
+index 4b969609a33..7cf6342d5ee 100644
+--- a/packages/ai/src/transports/openai-completions-stream.ts
++++ b/packages/ai/src/transports/openai-completions-stream.ts
+@@ -43,6 +43,7 @@ import {
+   isOpenAICompletionsThinkingEnabled,
+   log,
+   parseOpenAICompletionsUsage,
++  parseServerGenerationMetrics,
+   readOpenAICompletionsContentDeltas,
+   readOpenAICompletionsReasoningBatch,
+   type MutableAssistantOutput,
+@@ -438,6 +439,10 @@ export async function processCompletionsStream(
+       output.usage = parseOpenAICompletionsUsage(usage, model, {
+         includeReasoningTokens: !directMode,
+       });
++      const serverGeneration = parseServerGenerationMetrics(chunk);
++      if (serverGeneration) {
++        output.serverGeneration = serverGeneration;
++      }
+     }
+     const rawChoiceDelta = choice?.delta ?? choice?.message;
+     // Classify before legacy-tool buffering and hidden-reasoning display filtering.
+diff --git a/packages/ai/src/transports/openai-transport-shared.ts b/packages/ai/src/transports/openai-transport-shared.ts
+index 19c8f618e81..81bc8cdfe83 100644
+--- a/packages/ai/src/transports/openai-transport-shared.ts
++++ b/packages/ai/src/transports/openai-transport-shared.ts
+@@ -2,6 +2,7 @@ import type {
+   AssistantMessage,
+   Model,
+   OpenAICompletionsCompat,
++  ServerGenerationMetrics,
+   TextContent,
+   ThinkingContent,
+   ToolCall,
+@@ -398,6 +399,27 @@ export function parseOpenAICompletionsUsage(
+   return usage;
+ }
+ 
++function finitePositive(value: unknown): number | undefined {
++  return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : undefined;
++}
++
++/**
++ * Reads the server's decode timing from a chat-completions chunk. Cerebras ends
++ * every stream with `time_info.completion_time` (seconds) next to
++ * `usage.completion_tokens`; their ratio is the call's decode speed. Returns
++ * undefined for chunks without both.
++ */
++export function parseServerGenerationMetrics(chunk: unknown): ServerGenerationMetrics | undefined {
++  if (!isRecord(chunk) || !isRecord(chunk.time_info) || !isRecord(chunk.usage)) {
++    return undefined;
++  }
++  const completionSeconds = finitePositive(chunk.time_info.completion_time);
++  const outputTokens = finitePositive(chunk.usage.completion_tokens);
++  return completionSeconds !== undefined && outputTokens !== undefined
++    ? { completionMs: completionSeconds * 1000, outputTokens }
++    : undefined;
++}
++
+ export function createOpenAIResponseHook(
+   onResponse: BaseOpenAIStreamOptions["onResponse"],
+   response: Response,
+diff --git a/packages/llm-core/src/types.ts b/packages/llm-core/src/types.ts
+index 19318703c85..ce16d28f5d8 100644
+--- a/packages/llm-core/src/types.ts
++++ b/packages/llm-core/src/types.ts
+@@ -498,6 +498,18 @@ export type AssistantDeliveryTtsFacts = {
+   }>;
+ };
+ 
++/**
++ * Decode timing the serving endpoint reported for one response: Cerebras sends
++ * `time_info.completion_time` and `usage.completion_tokens` in the last chunk.
++ * Their ratio is the server's decode speed for the call.
++ */
++export interface ServerGenerationMetrics {
++  /** Server-side decode time of the completion tokens (`time_info.completion_time`). */
++  completionMs: number;
++  /** Completion tokens the server counted, reasoning included (`usage.completion_tokens`). */
++  outputTokens: number;
++}
++
+ export interface AssistantMessage {
+   role: "assistant";
+   content: (TextContent | ThinkingContent | ToolCall)[];
+@@ -521,6 +533,8 @@ export interface AssistantMessage {
+   turnId?: string; // Runtime-assigned stable turn identity when the provider does not expose one
+   diagnostics?: AssistantMessageDiagnostic[]; // Redacted provider/runtime completion, failure, and recovery diagnostics.
+   usage: Usage;
++  /** Decode timing the serving endpoint reported for this response (Cerebras `time_info`). */
++  serverGeneration?: ServerGenerationMetrics;
+   stopReason: StopReason;
+   /** A completed provider response can explicitly request another inference with false. */
+   endTurn?: boolean;
+diff --git a/src/agents/embedded-agent-subscribe.handlers.messages.lifecycle.test.ts b/src/agents/embedded-agent-subscribe.handlers.messages.lifecycle.test.ts
+index fdde392a9f7..997f97b1076 100644
+--- a/src/agents/embedded-agent-subscribe.handlers.messages.lifecycle.test.ts
++++ b/src/agents/embedded-agent-subscribe.handlers.messages.lifecycle.test.ts
+@@ -1,4 +1,8 @@
+ import { describe, expect, it, vi } from "vitest";
++import {
++  onAgentEvent as subscribeAgentEvents,
++  type AgentEventPayload,
++} from "../infra/agent-events.js";
+ import { normalizeTextForComparison } from "./embedded-agent-helpers.js";
+ import {
+   createMessageEndContext,
+@@ -14,6 +18,33 @@ import {
+ const textMessage = (text: string) => ({ role: "assistant", content: [{ type: "text", text }] });
+ 
+ describe("handleMessageEnd", () => {
++  it("reports each finished model call's server decode timing on the generation stream", () => {
++    const events: AgentEventPayload[] = [];
++    const stop = subscribeAgentEvents((event) => {
++      if (event.runId === "run-1" && event.stream === "generation") {
++        events.push(event);
++      }
++    });
++    try {
++      const ctx = createMessageEndContext();
++      void endMessage(ctx, {
++        message: {
++          role: "assistant",
++          content: [{ type: "text", text: "done" }],
++          usage: { output: 120 },
++          serverGeneration: { completionMs: 140, outputTokens: 120 },
++        },
++      });
++
++      expect(events).toHaveLength(1);
++      expect(events[0]?.data).toEqual({
++        serverGeneration: { completionMs: 140, outputTokens: 120 },
++      });
++    } finally {
++      stop();
++    }
++  });
++
+   it("preserves malformed final text across streamed and final delivery", async () => {
+     const onAgentEvent = vi.fn();
+     const onBlockReply = vi.fn();
+diff --git a/src/agents/embedded-agent-subscribe.handlers.messages.lifecycle.ts b/src/agents/embedded-agent-subscribe.handlers.messages.lifecycle.ts
+index 5a37aa9fcd8..c2276804b3b 100644
+--- a/src/agents/embedded-agent-subscribe.handlers.messages.lifecycle.ts
++++ b/src/agents/embedded-agent-subscribe.handlers.messages.lifecycle.ts
+@@ -26,6 +26,7 @@ import {
+   scopeAssistantMessageToStreamBlock,
+   shouldSuppressDeterministicApprovalOutput,
+ } from "./embedded-agent-subscribe.handlers.messages.stream.js";
++import { emitCompletedGeneration } from "./embedded-agent-subscribe.handlers.messages.update.js";
+ import type { EmbeddedAgentSubscribeContext } from "./embedded-agent-subscribe.handlers.types.js";
+ import { appendRawStream } from "./embedded-agent-subscribe.raw-stream.js";
+ import { warnIfAssistantEmittedSuspiciousText } from "./embedded-agent-subscribe.tool-text-diagnostics.js";
+@@ -88,6 +89,7 @@ export function handleMessageEnd(
+   // the completed model round trips consumers see as `assistantTurns`.
+   ctx.state.assistantTurnCount += 1;
+   const assistantMessage = msg;
++  emitCompletedGeneration(ctx, assistantMessage);
+   const assistantPhase = resolveAssistantMessagePhase(assistantMessage);
+   const suppressVisibleAssistantOutput = assistantPhase === "commentary";
+   const suppressDeterministicApprovalOutput = shouldSuppressDeterministicApprovalOutput(ctx.state);
+diff --git a/src/agents/embedded-agent-subscribe.handlers.messages.update.ts b/src/agents/embedded-agent-subscribe.handlers.messages.update.ts
+index 352661b5509..cf47700fa1d 100644
+--- a/src/agents/embedded-agent-subscribe.handlers.messages.update.ts
++++ b/src/agents/embedded-agent-subscribe.handlers.messages.update.ts
+@@ -51,6 +51,25 @@ import {
+ } from "./embedded-agent-utils.js";
+ import type { AgentEvent, AgentMessage } from "./runtime/index.js";
+ 
++/**
++ * Emits a finished model call's server decode timing (Cerebras `time_info`) on
++ * the run's `generation` stream, so clients can show the run's speed so far
++ * while it continues. Calls without server timing emit nothing.
++ */
++export function emitCompletedGeneration(
++  ctx: EmbeddedAgentSubscribeContext,
++  msg: AssistantMessage,
++): void {
++  if (!msg.serverGeneration) {
++    return;
++  }
++  emitAgentEvent({
++    runId: ctx.params.runId,
++    stream: "generation",
++    data: { serverGeneration: msg.serverGeneration },
++  });
++}
++
+ export function handleMessageUpdate(
+   ctx: EmbeddedAgentSubscribeContext,
+   evt: AgentEvent & { message: AgentMessage; assistantMessageEvent?: unknown },
+diff --git a/ui/src/i18n/locales/en-chat-message-metadata.ts b/ui/src/i18n/locales/en-chat-message-metadata.ts
+index d0d6acf63fd..f52744fa2f0 100644
+--- a/ui/src/i18n/locales/en-chat-message-metadata.ts
++++ b/ui/src/i18n/locales/en-chat-message-metadata.ts
+@@ -79,6 +79,11 @@ const enChatMessageMetadata = {
+       voiceNote: "Voice note",
+       duplicatesCollapsed: "{count} consecutive identical messages collapsed",
+       contextFor: "Message context for {timestamp}",
++      generationSpeedPercentilesServer: "{mean} tok/s mean · {p90} p90 (server)",
++      generationSpeedMeanDetail: "mean: the average of {calls} model calls' rates, {mean} tok/s.",
++      generationSpeedP90Detail: "p90: 90% of {calls} model calls ran at or below {p90} tok/s.",
++      generationSpeedServerDetail:
++        "Reported by the server: {tokens} tokens in {seconds} s of decode over {calls} model calls.",
+     },
+   },
+ } satisfies TranslationMap;
+diff --git a/ui/src/pages/chat/chat-generation-speed.test.ts b/ui/src/pages/chat/chat-generation-speed.test.ts
+new file mode 100644
+index 00000000000..aede28577c2
+--- /dev/null
++++ b/ui/src/pages/chat/chat-generation-speed.test.ts
+@@ -0,0 +1,54 @@
++import { describe, expect, it } from "vitest";
++import { formatTokensPerSecond, generationSpeed } from "./chat-generation-speed.ts";
++
++/** An assistant message with the decode timing Cerebras reported for it. */
++function call(outputTokens: number, completionMs: number) {
++  return {
++    role: "assistant",
++    usage: { output: outputTokens },
++    serverGeneration: { completionMs, outputTokens },
++  };
++}
++
++describe("generation speed", () => {
++  it("averages the per-call server rates, so each model call counts once", () => {
++    // 1,000 tok/s, 250 tok/s and 2,000 tok/s.
++    const speed = generationSpeed([
++      call(400, 400),
++      { role: "toolResult" },
++      call(50, 200),
++      call(1_000, 500),
++    ]);
++
++    expect(speed).toEqual({
++      meanTokensPerSecond: (1_000 + 250 + 2_000) / 3,
++      p90TokensPerSecond: 2_000,
++      outputTokens: 1_450,
++      generationMs: 1_100,
++      calls: 3,
++    });
++  });
++
++  it("takes the nearest-rank 90th percentile of the per-call rates", () => {
++    const calls = Array.from({ length: 20 }, (_, index) => call((index + 1) * 100, 1_000));
++
++    expect(generationSpeed(calls)?.p90TokensPerSecond).toBe(1_800);
++  });
++
++  it("ignores messages without server timing and returns null when none have it", () => {
++    const untimed = [
++      { role: "user", content: "hi" },
++      { role: "assistant", usage: { output: 10 } },
++      { role: "assistant", serverGeneration: { completionMs: 0, outputTokens: 10 } },
++      { role: "assistant", serverGeneration: { completionMs: 100, outputTokens: 0 } },
++    ];
++
++    expect(generationSpeed(untimed)).toBeNull();
++    expect(generationSpeed([...untimed, call(500, 1_000)])?.calls).toBe(1);
++  });
++
++  it("formats high rates as integers and low rates with one decimal", () => {
++    expect(formatTokensPerSecond(1234.4)).toBe((1234).toLocaleString());
++    expect(formatTokensPerSecond(42.26)).toBe("42.3");
++  });
++});
+diff --git a/ui/src/pages/chat/chat-generation-speed.ts b/ui/src/pages/chat/chat-generation-speed.ts
+new file mode 100644
+index 00000000000..b431ce89b38
+--- /dev/null
++++ b/ui/src/pages/chat/chat-generation-speed.ts
+@@ -0,0 +1,134 @@
++import { html, nothing } from "lit";
++import { t } from "../../i18n/index.ts";
++
++/**
++ * Generation speed of a response, a run, or a session, from the decode timing
++ * Cerebras reports for every model call: `time_info.completion_time` and
++ * `usage.completion_tokens` in the stream's last chunk, kept on the assistant
++ * message as `serverGeneration`. Each call's rate is its tokens over its decode
++ * time, so queueing, prefill, network, and tool time are excluded.
++ */
++export type GenerationSpeed = {
++  /** Mean of the per-call rates: the headline. */
++  meanTokensPerSecond: number;
++  /** 90th-percentile per-call rate (nearest rank); below 10 calls it is the fastest call. */
++  p90TokensPerSecond: number;
++  /** Completion tokens and decode time summed over the calls. */
++  outputTokens: number;
++  generationMs: number;
++  calls: number;
++};
++
++type CallSpeed = { outputTokens: number; generationMs: number };
++
++function readNumber(record: Record<string, unknown>, key: string): number | undefined {
++  const value = record[key];
++  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
++}
++
++/** One model call's server decode timing, from an assistant message's `serverGeneration`. */
++function readCall(message: unknown): CallSpeed | null {
++  if (!message || typeof message !== "object") {
++    return null;
++  }
++  const record = message as Record<string, unknown>;
++  const server = record.serverGeneration;
++  if (record.role !== "assistant" || !server || typeof server !== "object") {
++    return null;
++  }
++  const completionMs = readNumber(server as Record<string, unknown>, "completionMs");
++  const outputTokens = readNumber(server as Record<string, unknown>, "outputTokens");
++  return completionMs !== undefined &&
++    completionMs > 0 &&
++    outputTokens !== undefined &&
++    outputTokens >= 1
++    ? { outputTokens, generationMs: completionMs }
++    : null;
++}
++
++function callRate(call: CallSpeed): number {
++  return call.outputTokens / (call.generationMs / 1000);
++}
++
++/** Mean and p90 of the per-call rates over the messages' server-timed model calls; null when there are none. */
++export function generationSpeed(messages: readonly unknown[]): GenerationSpeed | null {
++  const calls = messages.map(readCall).filter((call): call is CallSpeed => call !== null);
++  if (calls.length === 0) {
++    return null;
++  }
++  const rates = calls.map(callRate);
++  const sorted = rates.toSorted((a, b) => a - b);
++  return {
++    meanTokensPerSecond: rates.reduce((sum, rate) => sum + rate, 0) / rates.length,
++    p90TokensPerSecond: sorted[Math.max(0, Math.ceil(0.9 * sorted.length) - 1)] ?? 0,
++    outputTokens: calls.reduce((sum, call) => sum + call.outputTokens, 0),
++    generationMs: calls.reduce((sum, call) => sum + call.generationMs, 0),
++    calls: calls.length,
++  };
++}
++
++export function formatTokensPerSecond(rate: number): string {
++  return rate >= 100 ? Math.round(rate).toLocaleString() : rate.toFixed(1);
++}
++
++function speedLabel(speed: GenerationSpeed): string {
++  return t("chat.messages.generationSpeedPercentilesServer", {
++    mean: formatTokensPerSecond(speed.meanTokensPerSecond),
++    p90: formatTokensPerSecond(speed.p90TokensPerSecond),
++  });
++}
++
++function speedDetail(speed: GenerationSpeed): string {
++  const calls = String(speed.calls);
++  return [
++    t("chat.messages.generationSpeedMeanDetail", {
++      mean: formatTokensPerSecond(speed.meanTokensPerSecond),
++      calls,
++    }),
++    t("chat.messages.generationSpeedP90Detail", {
++      p90: formatTokensPerSecond(speed.p90TokensPerSecond),
++      calls,
++    }),
++    t("chat.messages.generationSpeedServerDetail", {
++      tokens: speed.outputTokens.toLocaleString(),
++      seconds: (speed.generationMs / 1000).toFixed(1),
++      calls,
++    }),
++  ].join("\n");
++}
++
++/** Per-response badge; nothing when no call in the response was server-timed. */
++export function renderGenerationSpeedBadge(speed: GenerationSpeed | null) {
++  if (!speed) {
++    return nothing;
++  }
++  return html`<span class="chat-gen-speed" title=${speedDetail(speed)}>${speedLabel(speed)}</span>`;
++}
++
++/**
++ * Live badge in the working indicator: the run's speed over the model calls
++ * that have finished so far, updated as each one finishes.
++ */
++export function renderLiveGenerationSpeed(
++  progress: { runSpeed?: GenerationSpeed | null } | null | undefined,
++) {
++  const run = progress?.runSpeed;
++  if (!run) {
++    return nothing;
++  }
++  return html`<span aria-hidden="true">·</span
++    ><span class="chat-gen-speed chat-gen-speed--live" title=${speedDetail(run)}
++      >${speedLabel(run)}</span
++    >`;
++}
++
++/** Persistent composer readout over the whole visible session. */
++export function renderGenerationSpeedSummary(messages: readonly unknown[] | undefined) {
++  const session = messages ? generationSpeed(messages) : null;
++  if (!session) {
++    return nothing;
++  }
++  return html`<span class="chat-gen-speed chat-gen-speed--summary" title=${speedDetail(session)}
++    >${speedLabel(session)}</span
++  >`;
++}
+diff --git a/ui/src/pages/chat/chat-pane-render.ts b/ui/src/pages/chat/chat-pane-render.ts
+index c278eca60d7..2026efe057e 100644
+--- a/ui/src/pages/chat/chat-pane-render.ts
++++ b/ui/src/pages/chat/chat-pane-render.ts
+@@ -453,6 +453,7 @@ export class ChatPane extends ChatPaneLayoutRender {
+       streamStartedAt: catalogKey ? null : state.chatStreamStartedAt,
+       runId: catalogKey ? null : projectionRunId,
+       runUsageById: catalogKey ? undefined : state.chatRunUsageById,
++      runGenerationById: catalogKey ? undefined : state.chatRunGenerationById,
+       assistantAvatarUrl: resolveChatAvatarUrl(state),
+       sendShortcut: state.settings.chatSendShortcut,
+       followUpMode: state.chatFollowUpMode,
+diff --git a/ui/src/pages/chat/chat-state-contract.ts b/ui/src/pages/chat/chat-state-contract.ts
+index b083754931c..9dcb43bde68 100644
+--- a/ui/src/pages/chat/chat-state-contract.ts
++++ b/ui/src/pages/chat/chat-state-contract.ts
+@@ -19,6 +19,7 @@ import type { StreamCausalBoundaryState } from "./stream-causal-boundary.ts";
+ import type {
+   LiveToolStreamState,
+   ProviderPolicyNotice,
++  RunGenerationProgress,
+   RunOutputUsage,
+ } from "./tool-stream-contract.ts";
+ 
+@@ -68,6 +69,7 @@ export type ChatState = StreamCausalBoundaryState & {
+    * Stop must use the session-owned abort path (sessions.abort), not chat.abort. */
+   chatRunSessionAbortable?: boolean;
+   chatRunUsageById?: Map<string, RunOutputUsage>;
++  chatRunGenerationById?: Map<string, RunGenerationProgress>;
+   providerPolicyNotice?: ProviderPolicyNotice | null;
+   /** Producer-cumulative text; visible tails derive from the segment baseline. */
+   chatStream: string | null;
+diff --git a/ui/src/pages/chat/chat-state-page.ts b/ui/src/pages/chat/chat-state-page.ts
+index 255e7d674ae..9aaa823b00b 100644
+--- a/ui/src/pages/chat/chat-state-page.ts
++++ b/ui/src/pages/chat/chat-state-page.ts
+@@ -82,7 +82,7 @@ import {
+   openSlot,
+   sidebarDashboardPresentation,
+ } from "./sidebar-layout.ts";
+-import type { RunOutputUsage } from "./tool-stream-contract.ts";
++import type { RunGenerationProgress, RunOutputUsage } from "./tool-stream-contract.ts";
+ import { resetToolStream } from "./tool-stream-state.ts";
+ 
+ function cancelPendingQueuedChatInput(state: ChatPageHost, id: string): boolean {
+@@ -248,6 +248,7 @@ export function createPageState(
+     chatAttachments: [],
+     chatRunId: null,
+     chatRunUsageById: new Map<string, RunOutputUsage>(),
++    chatRunGenerationById: new Map<string, RunGenerationProgress>(),
+     chatStream: null,
+     chatStreamStartedAt: null,
+     chatRunStartup: null,
+diff --git a/ui/src/pages/chat/components/chat-agent-run-frame.ts b/ui/src/pages/chat/components/chat-agent-run-frame.ts
+index 9b351fdf3dc..c0fbc2891f8 100644
+--- a/ui/src/pages/chat/components/chat-agent-run-frame.ts
++++ b/ui/src/pages/chat/components/chat-agent-run-frame.ts
+@@ -7,6 +7,7 @@ import {
+   chatItemGroups,
+   type AgentRunFrameRenderItem,
+ } from "../chat-agent-run-grouping.ts";
++import { generationSpeed } from "../chat-generation-speed.ts";
+ import type { TurnRecap } from "../chat-progress.ts";
+ import { rawMessageTimestamp } from "../chat-thread-items.ts";
+ import {
+@@ -142,5 +143,8 @@ export function renderAgentRunFrame(frame: AgentRunFrameRenderItem, opts: AgentR
+     frameReplyLine,
+     frameActionOwner: actionOwner,
+     turnRecap: opts.turnRecap,
++    generationSpeed: generationSpeed(
++      groups.flatMap((group) => group.messages.map((item) => item.message)),
++    ),
+   });
+ }
+diff --git a/ui/src/pages/chat/components/chat-composer-view.ts b/ui/src/pages/chat/components/chat-composer-view.ts
+index d36faa96b55..6a14e9321c5 100644
+--- a/ui/src/pages/chat/components/chat-composer-view.ts
++++ b/ui/src/pages/chat/components/chat-composer-view.ts
+@@ -15,6 +15,7 @@ import { clearCompositionEnd } from "../../../lib/ime.ts";
+ import { detectTextDirection } from "../../../lib/text-direction.ts";
+ import { presentedContent } from "../../../lit/presentation-binding.ts";
+ import "../../../styles/chat/composer-context-strip.css";
++import { renderGenerationSpeedSummary } from "../chat-generation-speed.ts";
+ import type { ComposerDictationController } from "../composer-dictation.ts";
+ import { insertComposerDictation } from "../composer-dictation.ts";
+ import { renderChatAttachmentInputs } from "./chat-attachment-inputs.ts";
+@@ -146,11 +147,11 @@ export function renderChatComposerView(context: ChatComposerViewContext) {
+     menuListboxId: slashMenuListboxId,
+   } = menus;
+   const activeSession = props.selectedSession;
+-  const contextNotice = renderContextNotice(
++  const contextNotice = html`${renderGenerationSpeedSummary(props.messages)}${renderContextNotice(
+     activeSession,
+     props.sessions?.defaults?.contextTokens ?? null,
+     { messages: props.messages, providerUsage: props.providerUsage },
+-  );
++  )}`;
+   const composerControls = props.composerControls ?? nothing;
+   const composerLeadControl = props.permissionPicker
+     ? renderChatPermissionPicker(props.permissionPicker)
+diff --git a/ui/src/pages/chat/components/chat-message-group-options.ts b/ui/src/pages/chat/components/chat-message-group-options.ts
+index 8bb028c0f0d..65194b360d4 100644
+--- a/ui/src/pages/chat/components/chat-message-group-options.ts
++++ b/ui/src/pages/chat/components/chat-message-group-options.ts
+@@ -2,6 +2,7 @@ import type { BrowserTabSelection } from "../../../components/browser/browser-ta
+ import type { PersonActivityRouting } from "../../../components/person-activity-link.ts";
+ import type { MessageGroup } from "../../../lib/chat/chat-types.ts";
+ import type { renderForwardedAvatar } from "../chat-avatar.ts";
++import type { GenerationSpeed } from "../chat-generation-speed.ts";
+ import type { AssistantMessageExpansionState } from "../chat-message-recovery.ts";
+ import type { TurnRecap } from "../chat-progress.ts";
+ import type { renderGroupedMessage } from "./chat-message-bubble.ts";
+@@ -56,6 +57,8 @@ export type RenderMessageGroupOptions = Omit<
+     activityRunId?: string | null;
+     activityGroupKey?: string;
+     turnRecap?: TurnRecap;
++    /** A run frame's speed covers every model call in the run, not just its first group. */
++    generationSpeed?: GenerationSpeed | null;
+     /** Frame bodies are pre-rendered by the frame owner; ordinary groups omit them. */
+     frameContent?: readonly unknown[];
+     frameActionOwner?: MessageGroup["messages"][number] | null;
+diff --git a/ui/src/pages/chat/components/chat-message-group.ts b/ui/src/pages/chat/components/chat-message-group.ts
+index a8ee7b399dd..70cfd0a7c0f 100644
+--- a/ui/src/pages/chat/components/chat-message-group.ts
++++ b/ui/src/pages/chat/components/chat-message-group.ts
+@@ -23,6 +23,7 @@ import { resolveIdentityHue } from "../../../lib/identity-avatar.ts";
+ import { DEFAULT_AGENT_ID } from "../../../lib/sessions/session-key.ts";
+ import { resolveAssistantReplyPhase } from "../chat-assistant-reply.ts";
+ import { renderChatAvatar, renderForwardedAvatar } from "../chat-avatar.ts";
++import { generationSpeed, renderGenerationSpeedBadge } from "../chat-generation-speed.ts";
+ import { ownSessionLaunchCalls } from "../chat-spawned-subagent.ts";
+ import { transcriptRunId } from "../chat-thread-run-identity.ts";
+ import { persistedMessageEntryId, readPendingSendStatus } from "../chat-thread.ts";
+@@ -485,6 +486,10 @@ export function renderMessageGroup(group: MessageGroup, options: RenderMessageGr
+   }`;
+ 
+   const meta = extractGroupMeta(group, opts.contextWindow ?? null);
++  const speed =
++    opts.generationSpeed !== undefined
++      ? opts.generationSpeed
++      : generationSpeed(group.messages.map((item) => item.message));
+ 
+   if (normalizedRole === "tool" && opts.showToolCalls === false) {
+     return nothing;
+@@ -696,6 +701,7 @@ export function renderMessageGroup(group: MessageGroup, options: RenderMessageGr
+                       : nothing
+                   }
+                   ${renderSenderIdentity()} ${renderChatSendStatus(sendStatus, opts)}
++                  ${normalizedRole === "assistant" ? renderGenerationSpeedBadge(speed) : nothing}
+                   ${renderMessageMeta(group.timestamp, meta)}
+                 </div>
+                 ${
+diff --git a/ui/src/pages/chat/components/chat-message-stream.ts b/ui/src/pages/chat/components/chat-message-stream.ts
+index 1e4908fdd6b..897f04710e0 100644
+--- a/ui/src/pages/chat/components/chat-message-stream.ts
++++ b/ui/src/pages/chat/components/chat-message-stream.ts
+@@ -13,6 +13,7 @@ import { resolveToolDisplay } from "../../../lib/chat/tool-display.ts";
+ import { formatDurationLong } from "../../../lib/format-duration.ts";
+ import { renderChatAvatar } from "../chat-avatar.ts";
+ import type { ChatSubagentWait } from "../chat-subagent-wait.ts";
++import type { RunGenerationProgress } from "../tool-stream-contract.ts";
+ import { renderGroupedMessage } from "./chat-message-bubble.ts";
+ import { prepareChatMessageRender, resolveMessageActionDetails } from "./chat-message-markdown.ts";
+ import { renderChatTimestamp } from "./chat-message-timestamp.ts";
+@@ -80,6 +81,7 @@ export type StreamGroupOptions = StreamMessageOptions & {
+   onOpenSubagent?: (key: string) => void;
+   onOpenSubagents?: () => void;
+   runOutputTokens?: number | null;
++  runGeneration?: RunGenerationProgress | null;
+   questionPrompts?: ReadonlyMap<string, QuestionPrompt>;
+ };
+ 
+@@ -132,6 +134,7 @@ export function renderStreamGroupPart(
+       onOpenSubagents: opts.onOpenSubagents,
+       startupLabel: opts.startupLabel,
+       outputTokens: opts.runOutputTokens,
++      generation: opts.runGeneration,
+       presentation,
+     });
+   }
+diff --git a/ui/src/pages/chat/components/chat-thread-interactions.ts b/ui/src/pages/chat/components/chat-thread-interactions.ts
+index 1dedf5d467c..1bc916f3d0e 100644
+--- a/ui/src/pages/chat/components/chat-thread-interactions.ts
++++ b/ui/src/pages/chat/components/chat-thread-interactions.ts
+@@ -41,7 +41,11 @@ import type { PluginToolIcons } from "../chat-tool-icon-controller.ts";
+ import type { ChatTypingActorView, ChatTypingOverflow } from "../chat-typing-presence.ts";
+ import type { LinkFaviconFetcher } from "../link-favicon-cache.ts";
+ import type { RealtimeTalkConversationEntry } from "../talk/conversation.ts";
+-import type { CompactionStatus, RunOutputUsage } from "../tool-stream-contract.ts";
++import type {
++  CompactionStatus,
++  RunGenerationProgress,
++  RunOutputUsage,
++} from "../tool-stream-contract.ts";
+ import type { AsyncQuestionDraft, AsyncQuestionPresentation } from "./chat-async-question.types.ts";
+ import { resolveChatContextCopy, usesNativeContextMenu } from "./chat-context-copy.ts";
+ import type { ChatHistoryBoundaryProps } from "./chat-history-boundary.ts";
+@@ -137,6 +141,8 @@ export type ChatThreadProps = ChatSendStatusActions &
+     /** Browser-local active run identity, retained across transient disconnects. */
+     runId?: string | null;
+     runUsageById?: ReadonlyMap<string, RunOutputUsage>;
++    /** Live speed of the model call generating in each run. */
++    runGenerationById?: ReadonlyMap<string, RunGenerationProgress>;
+     queue: ChatQueueItem[];
+     initialTurnId?: string;
+     pendingInputs?: ChatPendingInputsPage["items"];
+diff --git a/ui/src/pages/chat/components/chat-transcript-projection.ts b/ui/src/pages/chat/components/chat-transcript-projection.ts
+index 65fbce61158..12ed46fbd5f 100644
+--- a/ui/src/pages/chat/components/chat-transcript-projection.ts
++++ b/ui/src/pages/chat/components/chat-transcript-projection.ts
+@@ -149,6 +149,9 @@ export function projectChatTranscript(props: ChatThreadProps, transcript: ChatTr
+   const chatItems = buildCachedChatItems(chatItemsInput);
+   const { workingIndicator, activityRunId, activityGroupKey, runOutputTokens } =
+     projectTranscriptActivity(chatItems, props);
++  const runGeneration = workingIndicator?.runId
++    ? (props.runGenerationById?.get(workingIndicator.runId) ?? null)
++    : null;
+   const latestBrowserTabs = props.latestBrowserTabs;
+   syncToolCardExpansionState(
+     props.sessionKey,
+@@ -349,6 +352,7 @@ export function projectChatTranscript(props: ChatThreadProps, transcript: ChatTr
+     onOpenSubagent: (subagents.listed && props.onOpenSubagent) || props.onOpenSession,
+     onOpenSubagents: subagents.listed ? props.onOpenSubagents : undefined,
+     runOutputTokens,
++    runGeneration,
+     questionPrompts,
+   } satisfies StreamGroupOptions;
+   const renderGroupOptions = (item: MessageGroup) => {
+@@ -420,7 +424,11 @@ export function projectChatTranscript(props: ChatThreadProps, transcript: ChatTr
+   };
+   // Only the working indicator shows live usage and subagent status, so rows
+   // without one keep memoizing across usage and child-roster patches.
+-  const workingUsageKey = JSON.stringify([runOutputTokens, subagents.statusKey]);
++  const workingUsageKey = JSON.stringify([
++    runOutputTokens,
++    runGeneration?.seq ?? null,
++    subagents.statusKey,
++  ]);
+   const liveStatusSignature = (item: ChatRenderItem): string => {
+     if (item.kind === "stream-run") {
+       return item.parts.some((part) => part.kind === "reading-indicator") ? workingUsageKey : "";
+diff --git a/ui/src/pages/chat/components/chat-working-indicator.ts b/ui/src/pages/chat/components/chat-working-indicator.ts
+index 962606453bd..f8a181484cb 100644
+--- a/ui/src/pages/chat/components/chat-working-indicator.ts
++++ b/ui/src/pages/chat/components/chat-working-indicator.ts
+@@ -12,8 +12,10 @@ import { t } from "../../../i18n/index.ts";
+ import type { ChatItem } from "../../../lib/chat/chat-types.ts";
+ import { formatDurationLong } from "../../../lib/format-duration.ts";
+ import { formatCompactTokenCount } from "../../../lib/format.ts";
++import { renderLiveGenerationSpeed } from "../chat-generation-speed.ts";
+ import type { TurnRecap } from "../chat-progress.ts";
+ import type { ChatSubagentWait } from "../chat-subagent-wait.ts";
++import type { RunGenerationProgress } from "../tool-stream-contract.ts";
+ import { selectWorkingClawSurprise } from "./chat-working-indicator-surprise.ts";
+ 
+ // 0 is valid; only null/undefined means "unknown".
+@@ -40,6 +42,7 @@ export function renderChatWorkingIndicator(
+     onOpenSubagents?: () => void;
+     startupLabel?: string;
+     outputTokens?: number | null;
++    generation?: RunGenerationProgress | null;
+     presentation?: "standalone" | "continuation";
+   } = {},
+ ) {
+@@ -195,6 +198,7 @@ export function renderChatWorkingIndicator(
+               `
+             : nothing
+         }
++        ${waitingApproval ? nothing : renderLiveGenerationSpeed(options.generation)}
+       </span>
+     </div>
+     ${options.subagentActivity ?? nothing}
+diff --git a/ui/src/pages/chat/tool-stream-contract.ts b/ui/src/pages/chat/tool-stream-contract.ts
+index 3ceeec54877..6baec098f21 100644
+--- a/ui/src/pages/chat/tool-stream-contract.ts
++++ b/ui/src/pages/chat/tool-stream-contract.ts
+@@ -11,6 +11,7 @@ import type {
+ import type { DiffStat } from "../../lib/chat/tool-call-diff.ts";
+ import type { SessionCapability } from "../../lib/sessions/index.ts";
+ import type { UiSessionDefaultsHost } from "../../lib/sessions/session-key.ts";
++import type { GenerationSpeed } from "./chat-generation-speed.ts";
+ import type { ChatRunStartupState } from "./chat-run-startup.ts";
+ 
+ export type AgentEventPayload = AgentEvent & {
+@@ -44,6 +45,15 @@ export type ToolStreamEntry = {
+ 
+ export type RunOutputUsage = { outputTokens: number; seq: number };
+ 
++/** A running run's model calls that have finished so far, with their server decode timing. */
++export type RunGenerationProgress = {
++  /** The run's finished model calls, as transcript-shaped messages (`serverGeneration` only). */
++  finishedCalls: readonly unknown[];
++  /** Speed over the finished calls, aggregated like the response badge. */
++  runSpeed: GenerationSpeed | null;
++  seq: number;
++};
++
+ export type ProviderPolicyNotice = {
+   runId: string;
+   seq: number;
+@@ -85,6 +95,7 @@ export type ToolStreamHost = {
+   chatQueue?: readonly ChatQueueItem[];
+   chatMessages?: unknown[];
+   chatRunUsageById?: Map<string, RunOutputUsage>;
++  chatRunGenerationById?: Map<string, RunGenerationProgress>;
+   chatStream: string | null;
+   chatStreamStartedAt: number | null;
+   chatRunStartup?: ChatRunStartupState | null;
+diff --git a/ui/src/pages/chat/tool-stream.ts b/ui/src/pages/chat/tool-stream.ts
+index 8439e04ea0e..31fab0808bb 100644
+--- a/ui/src/pages/chat/tool-stream.ts
++++ b/ui/src/pages/chat/tool-stream.ts
+@@ -17,6 +17,7 @@ import { readLiveDiffStat } from "../../lib/chat/tool-call-diff.ts";
+ import { formatUiExternalText } from "../../lib/format-error.ts";
+ import { formatUnknownText, truncateText } from "../../lib/format.ts";
+ import { uiSessionEventMatches } from "../../lib/sessions/session-key.ts";
++import { generationSpeed } from "./chat-generation-speed.ts";
+ import { reconcileChatRunStartup } from "./chat-run-startup.ts";
+ import { getChatRunOwner } from "./history-merge.ts";
+ import { observedRunInputSendId } from "./stream-causal-boundary.ts";
+@@ -38,6 +39,8 @@ const PROVIDER_POLICY_PRECEDENCE = {
+ } as const;
+ const TOOL_STREAM_LIMIT = 50;
+ const RUN_USAGE_LIMIT = 50;
++// Bounds a run's retained finished calls; longer runs aggregate their latest calls.
++const RUN_FINISHED_CALL_LIMIT = 1_000;
+ const TOOL_STREAM_THROTTLE_MS = 80;
+ const TOOL_OUTPUT_CHAR_LIMIT = 120_000;
+ 
+@@ -287,6 +290,49 @@ function handleUsageEvent(host: ToolStreamHost, payload: AgentEventPayload): boo
+   return true;
+ }
+ 
++/**
++ * A finished model call's server decode timing (Cerebras `time_info`): added to
++ * the run's finished calls, read exactly like transcript messages, so the
++ * run's speed so far aggregates them the way the response badge does.
++ */
++function handleGenerationEvent(host: ToolStreamHost, payload: AgentEventPayload): boolean {
++  if (payload.stream !== "generation") {
++    return false;
++  }
++  const sessionKey = toTrimmedString(payload.sessionKey);
++  if (sessionKey) {
++    if (!uiSessionEventMatches(host, sessionKey, toTrimmedString(payload.agentId))) {
++      return true;
++    }
++  } else if (!host.chatRunId || payload.runId !== host.chatRunId) {
++    return true;
++  }
++  const serverGeneration = payload.data?.serverGeneration;
++  if (!serverGeneration || typeof serverGeneration !== "object") {
++    return true;
++  }
++  const current = host.chatRunGenerationById?.get(payload.runId);
++  if (current && payload.seq <= current.seq) {
++    return true;
++  }
++  const finishedCalls = [
++    ...(current?.finishedCalls ?? []),
++    { role: "assistant", serverGeneration },
++  ].slice(-RUN_FINISHED_CALL_LIMIT);
++  const byRun = new Map(host.chatRunGenerationById);
++  byRun.delete(payload.runId);
++  byRun.set(payload.runId, {
++    finishedCalls,
++    runSpeed: generationSpeed(finishedCalls),
++    seq: payload.seq,
++  });
++  for (const staleRunId of [...byRun.keys()].slice(0, -RUN_USAGE_LIMIT)) {
++    byRun.delete(staleRunId);
++  }
++  host.chatRunGenerationById = byRun;
++  return true;
++}
++
+ function handleNoticeEvent(host: ToolStreamHost, payload: AgentEventPayload): boolean {
+   const systemNotice = payload.stream === "notice";
+   if (!systemNotice && payload.stream !== "codex_app_server.guardian") {
+@@ -489,6 +535,7 @@ export function handleAgentEvent(
+   }
+ 
+   if (
++    handleGenerationEvent(host, payload) ||
+     handleUsageEvent(host, payload) ||
+     handleNoticeEvent(host, payload) ||
+     handleStreamStatus(host, payload) ||
+diff --git a/ui/src/pages/chat/tool-stream.usage.node.test.ts b/ui/src/pages/chat/tool-stream.usage.node.test.ts
+index 16ea944cff1..21989e75662 100644
+--- a/ui/src/pages/chat/tool-stream.usage.node.test.ts
++++ b/ui/src/pages/chat/tool-stream.usage.node.test.ts
+@@ -42,6 +42,37 @@ describe("app-tool-stream run usage", () => {
+     expect(host.chatRunUsageById?.get("still-active")?.outputTokens).toBe(59);
+   });
+ 
++  it("aggregates the run's finished calls from their server decode timing", () => {
++    const host = createHost({ chatRunId: "client-run" });
++    const finished = (seq: number, outputTokens: number, completionMs: number) =>
++      handleAgentEvent(
++        host,
++        agentEvent(
++          "client-run",
++          seq,
++          "generation",
++          { serverGeneration: { completionMs, outputTokens } },
++          "main",
++        ),
++      );
++    finished(1, 400, 400);
++    // A short tool-call step with a slow server rate counts as one call in the mean.
++    finished(2, 50, 200);
++    expect(host.chatRunGenerationById?.get("client-run")?.runSpeed).toEqual({
++      meanTokensPerSecond: 625,
++      p90TokensPerSecond: 1_000,
++      outputTokens: 450,
++      generationMs: 600,
++      calls: 2,
++    });
++
++    // An event without server timing leaves the run's speed as it was.
++    handleAgentEvent(host, agentEvent("client-run", 3, "generation", { outputTokens: 30 }, "main"));
++    const after = host.chatRunGenerationById?.get("client-run");
++    expect(after?.finishedCalls).toHaveLength(2);
++    expect(after?.runSpeed?.meanTokensPerSecond).toBe(625);
++  });
++
+   it("keeps the last usage through completion even without an intervening render", () => {
+     const host = createHost({ chatRunId: "client-run" });
+     handleAgentEvent(host, agentEvent("client-run", 1, "usage", { outputTokens: 695 }, "main"));
+diff --git a/ui/src/styles/chat/grouped.css b/ui/src/styles/chat/grouped.css
+index 31cfd802815..404c91df840 100644
+--- a/ui/src/styles/chat/grouped.css
++++ b/ui/src/styles/chat/grouped.css
+@@ -1679,6 +1679,30 @@ button.chat-reply-attribution__target:disabled {
+   white-space: nowrap;
+ }
+ 
++/* Generation-only tokens/sec: deliberately louder than the muted metadata. */
++.chat-gen-speed {
++  display: inline-flex;
++  align-items: center;
++  padding: 1px 8px;
++  border-radius: 999px;
++  font-family: var(--mono);
++  font-size: 0.95em;
++  font-weight: 600;
++  white-space: nowrap;
++  /* Info, not accent: the accent is red and would read as an error. */
++  color: var(--info);
++  background: var(--info-subtle);
++  font-variant-numeric: tabular-nums;
++}
++
++.chat-gen-speed--summary {
++  font-size: 0.85em;
++}
++
++.chat-gen-speed--live {
++  margin-left: 2px;
++}
++
+ .msg-meta__model {
+   background: var(--bg-hover, rgba(255, 255, 255, 0.06));
+   padding: 1px 6px;
+-- 
+2.50.1
+
+
+From ee32d208ca02e0790547bd0d6e91f6ae53452033 Mon Sep 17 00:00:00 2001
+From: OpenClaw Hackathon <hackathon@example.com>
+Date: Sat, 21 Nov 2026 05:08:43 +0000
+Subject: [PATCH 2/2] docs(dev): example config for Kimi on Cerebras's chat
+ completions API
+
+dev/cerebras-kimi/openclaw.json points OpenClaw's built-in Cerebras
+provider at https://api.cerebras.ai/v1 with the model
+moonshotai-kimi-k3.1-pro-trial and makes it the default model. The README
+explains each setting.
+
+The built-in catalog does not list Kimi, so the model is declared. It keeps
+the OpenAI-style defaults, which send `reasoning_effort`: Cerebras answers
+HTTP 400 to a `thinking` field and to `reasoning_content` on earlier
+assistant messages. It offers low, high and max as reasoning efforts;
+OpenClaw sends the supported effort at or below the thinking level picked
+in the UI. Strict tools are off.
+
+---
+ dev/cerebras-kimi/README.md     | 21 +++++++++++++++++++++
+ dev/cerebras-kimi/openclaw.json | 33 +++++++++++++++++++++++++++++++++
+ 2 files changed, 54 insertions(+)
+ create mode 100644 dev/cerebras-kimi/README.md
+ create mode 100644 dev/cerebras-kimi/openclaw.json
+
+diff --git a/dev/cerebras-kimi/README.md b/dev/cerebras-kimi/README.md
+new file mode 100644
+index 00000000000..3c620b55fb8
+--- /dev/null
++++ b/dev/cerebras-kimi/README.md
+@@ -0,0 +1,21 @@
++# Kimi on Cerebras: OpenClaw config
++
++`openclaw.json` here is an example config. It points OpenClaw's built-in Cerebras provider at Kimi on Cerebras's
++chat completions API (`https://api.cerebras.ai/v1`, model `moonshotai-kimi-k3.1-pro-trial`) and makes it the default
++model. Merge it into your OpenClaw config (`~/.openclaw/openclaw.json` by default) and set `CEREBRAS_API_KEY` in the
++Gateway's environment. Requests go straight from OpenClaw to Cerebras, with no proxy.
++
++The built-in Cerebras catalog does not list Kimi, so the model is declared here. The settings follow what this
++endpoint accepts:
++
++| Setting | Why |
++| --- | --- |
++| `api: openai-completions`, no `thinkingFormat` | OpenClaw's OpenAI-style defaults send `reasoning_effort`, and multi-step tool runs go through. Cerebras answers HTTP 400 to a `thinking` field and to `reasoning_content` on earlier assistant messages; the `deepseek` thinking format sends both. |
++| `supportedReasoningEfforts: ["low", "high", "max"]` | The efforts offered for this model (Kimi here also takes `medium`; `none`, `minimal` and `xhigh` get HTTP 400). The UI then offers off, minimal, low, medium, high, max and ultra, and OpenClaw sends the supported effort at or below the level: `minimal`, `low` and `medium` as `low`, `high` as `high`, `max` and `ultra` as `max`. With thinking off, no effort is sent and the server's default applies. |
++| `supportsStrictMode: false` | Strict tool schemas are rejected for this model on some accounts. |
++| `reasoning: true`, `input: ["text", "image"]` | Kimi streams its reasoning and accepts images (browser screenshots). |
++| `thinkingDefault: "low"` | Sessions start at low effort; change it in the UI or drop the line for OpenClaw's default. |
++
++The generation-speed display in the chat relies on Cerebras's `time_info`: every response's last streamed chunk
++carries `time_info.completion_time` and `usage.completion_tokens`, and the UI shows their ratio per model call as
++`<mean> tok/s mean · <p90> p90 (server)`.
+diff --git a/dev/cerebras-kimi/openclaw.json b/dev/cerebras-kimi/openclaw.json
+new file mode 100644
+index 00000000000..a15d97f3492
+--- /dev/null
++++ b/dev/cerebras-kimi/openclaw.json
+@@ -0,0 +1,33 @@
++{
++  "agents": {
++    "defaults": {
++      "model": { "primary": "cerebras/moonshotai-kimi-k3.1-pro-trial" },
++      "thinkingDefault": "low"
++    }
++  },
++  "models": {
++    "mode": "merge",
++    "providers": {
++      "cerebras": {
++        "baseUrl": "https://api.cerebras.ai/v1",
++        "api": "openai-completions",
++        "apiKey": "${CEREBRAS_API_KEY}",
++        "models": [
++          {
++            "id": "moonshotai-kimi-k3.1-pro-trial",
++            "name": "Kimi K3.1 Pro (Cerebras)",
++            "reasoning": true,
++            "input": ["text", "image"],
++            "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
++            "compat": {
++              "supportsTools": true,
++              "supportsStrictMode": false,
++              "supportsReasoningEffort": true,
++              "supportedReasoningEfforts": ["low", "high", "max"]
++            }
++          }
++        ]
++      }
++    }
++  }
++}
+-- 
+2.50.1
+

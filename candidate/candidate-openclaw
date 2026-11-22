@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+bounty_dir="$(dirname -- "$(dirname -- "$(realpath -- "${BASH_SOURCE[0]}")")")"
+bounty_node="${OPENCLAW_BOUNTY_NODE:-$HOME/.local/share/mise/installs/node/26.13.1/bin/node}"
+bounty_env="${OPENCLAW_BOUNTY_ENV:-$HOME/Work/Cerebras_hackathon/.env}"
+
+export PATH="$(dirname -- "$bounty_node"):$PATH"
+export OPENCLAW_STATE_DIR="$bounty_dir/.candidate-state"
+export OPENCLAW_CONFIG_PATH="$OPENCLAW_STATE_DIR/openclaw.json"
+
+exec "$bounty_node" --env-file-if-exists="$bounty_env" "$bounty_dir/.bounty-build/openclaw.mjs" "$@"

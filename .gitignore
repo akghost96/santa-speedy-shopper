@@ -1,0 +1,24 @@
+# Allowlist: ignore everything, then name what is shared.
+# Never shared: .candidate-state/ and .bounty-state/ (gateway tokens, logs), .bounty-build/ (OpenClaw checkout).
+/*
+!/.gitignore
+!/README.md
+!/OPENCLAW-MODIFICATIONS.md
+!/official-openclaw-speed.patch
+!/candidate/
+!/scripts/
+!/evidence/
+!/submissions/
+/submissions/*
+!/submissions/candidate-1719tps.mp4
+!/.recording-work/
+/.recording-work/*
+!/.recording-work/capture-timed.mjs
+!/.recording-work/edit.py
+!/.recording-work/timed_edit.py
+!/.recording-work/verify_timed.py
+!/.recording-work/record-parallel.sh
+!/.recording-work/record-candidate-video.sh
+!/.recording-work/record-candidate.sh
+/candidate/santa-catalog/index.mjs.v3-clean-example
+/candidate/santa-catalog/openclaw.plugin.json.v2
