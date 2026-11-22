@@ -1,0 +1,9 @@
+{
+  "start_offset_ms": 1824.5,
+  "enter_offset_ms": 8126.699951171875,
+  "complete_offset_ms": 10148.699951171875,
+  "elapsed_ms": 2022.0,
+  "mean_tps": 1755,
+  "p90_tps": 1762,
+  "model_calls": 2
+}

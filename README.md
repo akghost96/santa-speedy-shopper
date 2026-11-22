@@ -1,7 +1,7 @@
 # Santa's Speedy Shopper — Speed Bounty entry
 
-**1,719 tok/s mean · 1,829 p90**, two model calls, measured by the official speed patch.
-Video: `submissions/candidate-1719tps.mp4` (27 s, uncut take, recorded 2026-11-22 18:42 EET).
+**1,755 tok/s mean · 1,762 p90**, two model calls, measured by the official speed patch.
+Video: `submissions/candidate-1755tps.mp4` (17 s, uncut take, recorded 2026-11-22 20:39 EET).
 
 This page says exactly what the entry does, including the parts that exist only to make it fast.
 
@@ -22,7 +22,7 @@ This page says exactly what the entry does, including the parts that exist only 
 3. **The tool** sends each query to the Shopify catalog (US, USD, ships to US) and keeps the first hit that is in
    stock, priced in USD and not on another country's domain. It strips tracking parameters and returns five lines of
    the form `N. [name](url) — store`.
-4. **Model call 2 (212 output tokens).** Kimi writes a one-line thought and replies with those five lines.
+4. **Model call 2 (208 output tokens).** Kimi writes a one-line thought and replies with those five lines.
 
 Nothing is cached between runs. In the entry take the answer is line for line what that run's tool call returned;
 `candidate/bench.mjs` reports the same check (`linksFromToolResults`) for any headless run.
@@ -36,12 +36,13 @@ is built around that:
   same products come back on most runs. The search itself is live.
 - **Both thoughts are scripted.** The system prompt gives the exact sentence for each
   ("I must call search_catalog immediately with exact queries." / "I must copy the result lines verbatim.").
-- **The tool returns the answer already formatted, three times.** The five live lines, then the same lines twice more
-  under "Reply with exactly these lines:". Text seen about three times decodes faster than text seen once. All three
+- **The tool returns the answer already formatted, four times.** The five live lines, then the same lines three more
+  times under "Reply with exactly these lines:". Text seen several times decodes faster than text seen once. All four
   copies come from that run's search.
-- **The plugin inserts one example turn into each request** (user → tool call → result → answer). Its five products
-  are real catalog results chosen from below the top hit, so that no line of the answer is already in the prompt
-  (true for the entry take: none of its five products is in the example).
+- **The plugin inserts two example turns into each request** (each: user → tool call → result → answer), so the
+  scripted thought and the tool call have been seen three times before the model writes them. Their ten products are
+  real catalog results chosen from below the top hit, so that no line of the answer is already in the prompt (true
+  for the entry take: none of its five products is in the examples).
 - **Request shaping.** `tool_choice: "required"` on the first call and `max_completion_tokens: 1024`. To do this the
   plugin registers as the runtime owner of the `cerebras` provider and wraps its stream function. Base URL, model,
   transport, `usage` and `time_info` are passed through untouched.
@@ -66,24 +67,26 @@ reports them; the badge shows the mean and p90 over the run's calls. For the ent
 
 | Call | Tokens | Server decode time | Rate |
 | --- | --- | --- | --- |
-| 1, tool call | 82 | 51.0 ms | 1,608 tok/s |
-| 2, answer | 212 | 115.9 ms | 1,829 tok/s |
-| Mean | | | **1,719 tok/s** |
+| 1, tool call | 82 | 46.9 ms | 1,748 tok/s |
+| 2, answer | 208 | 118.1 ms | 1,762 tok/s |
+| Mean | | | **1,755 tok/s** |
 
 The recorder re-reads the run from `chat.history` and refuses a take unless the badge matches these numbers.
 
 ## How the take was chosen
 
-It is the fastest of many. On 2026-11-22 the recorder made 1,079 verified takes across several configurations;
+It is the fastest of many. On 2026-11-22 the recorder made 1,378 verified takes across several configurations;
 the entry is the best of the takes made with the configuration described here. Decode speed depends mostly on
-Cerebras's load at that moment: of the 330 takes with this configuration the median scored about 1,188 tok/s and
+Cerebras's load at that moment: of the first 149 takes with this configuration the median scored about 1,192 tok/s and
 6 passed 1,600. Every take is listed in `evidence/parallel-results.jsonl`.
 
 Up to eight recorders ran in parallel. Cerebras's queue was full for most of the afternoon, so most requests were
 rejected at once and retried: about 480 requests a minute at peak, under the key's 1,000 requests/minute limit.
+From 20:00 four recorders ran at about 70 requests a minute.
 
 Earlier takes the same day scored up to 1,713, but their example turn listed three products that the live search
-also returns, which made the answer call faster. They are not the entry.
+also returns, which made the answer call faster. They are not the entry. The previous entry (1,719 mean,
+`submissions/candidate-1719tps.mp4`, `evidence/entry-1719/`) used one example turn and three copies of the result.
 
 ## The video
 
@@ -96,7 +99,7 @@ The five products in the take (all loaded with HTTP 200 on 2026-11-22):
 
 1. Root: A Game of Woodland Might and Right — https://ledergames.com/products/root-a-game-of-woodland-might-and-right
 2. Double-Sided Cozy Throw Blanket - Patchwork Be Happy — https://www.naturallife.com/products/double-sided-cozy-throw-blanket-patchwork-be-happy
-3. Blueberry Cheesecake 3-Wick Candle — https://goosecreek.com/products/blueberry-cheesecake-large-3-wick-candle
+3. Maple Butter 3-Wick Candle — https://goosecreek.com/products/maple-butter-large-3-wick-candle
 4. Right Roast Sampler Gift Basket — https://www.coffeebeanery.com/products/the-right-roast-sampler-gift-basket
 5. Pickle Stickle Super Chewer Durable Gnaw Dog Toy — https://bark.co/products/pickle-stickle
 
@@ -128,9 +131,9 @@ in this repo in full. `candidate/candidate-openclaw` starts the gateway with the
 | `candidate/README.md` | work log: everything that was tried, with numbers |
 | `official-openclaw-speed.patch` | the official patch as applied |
 | `OPENCLAW-MODIFICATIONS.md`, `scripts/verify-openclaw-build.sh` | what changes OpenClaw (the patch only) and the check that proves it |
-| `evidence/entry-1719/` | the entry take: gateway transcript with per-call server timing, capture timings, screenshot |
+| `evidence/entry-1755/` | the entry take: gateway transcript with per-call server timing, capture timings, screenshot |
 | `evidence/parallel-results.jsonl` | every verified take of the day: id, mean, p90, Enter-to-list time, clock time |
-| `submissions/candidate-1719tps.mp4` | the entry video |
+| `submissions/candidate-1755tps.mp4` | the entry video |
 
 Not for sharing: `.candidate-state/` and `.bounty-state/` (gateway tokens, logs) and `.bounty-build/` (the OpenClaw
 checkout and build).

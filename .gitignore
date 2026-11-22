@@ -11,6 +11,7 @@
 !/submissions/
 /submissions/*
 !/submissions/candidate-1719tps.mp4
+!/submissions/candidate-1755tps.mp4
 !/.recording-work/
 /.recording-work/*
 !/.recording-work/capture-timed.mjs
@@ -22,3 +23,4 @@
 !/.recording-work/record-candidate.sh
 /candidate/santa-catalog/index.mjs.v3-clean-example
 /candidate/santa-catalog/openclaw.plugin.json.v2
+/candidate/variant-openclaw

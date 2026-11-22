@@ -88,8 +88,10 @@
           "scriptedThoughts": true,
           "resultFormat": "lines",
           "queueStallMs": 8000,
-          "queueRetryDelayMs": 500,
-          "queueRetryAttempts": 400
+          "queueRetryDelayMs": 2200,
+          "queueRetryAttempts": 400,
+          "exampleTurns": 2,
+          "resultCopies": 4
         }
       }
     }

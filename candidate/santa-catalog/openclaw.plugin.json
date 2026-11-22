@@ -88,6 +88,18 @@
       },
       "preambleCall": {
         "type": "string"
+      },
+      "exampleTurns": {
+        "type": "integer",
+        "enum": [
+          1,
+          2
+        ]
+      },
+      "resultCopies": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 6
       }
     }
   },

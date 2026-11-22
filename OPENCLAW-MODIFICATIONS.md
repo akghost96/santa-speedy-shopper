@@ -35,7 +35,7 @@ OpenClaw's files.
 | `candidate/openclaw.example.json` | Model and provider (the patch's example values), temperature 0, thinking `low`, heartbeat off, tool profile `minimal` with only `search_catalog` allowed, Code Mode and tool search off, the plugin enabled |
 | `candidate/santa-catalog/index.mjs`, tool | Adds the `search_catalog` tool (live Shopify catalog search) |
 | same file, system prompt | Adds the `## Shopping` block quoted in `README.md` through the provider hook `resolveSystemPromptContribution` |
-| same file, provider | Registers as the runtime owner of the `cerebras` provider in place of the bundled Cerebras plugin, to wrap its stream function. The wrapper sets `tool_choice` and `max_completion_tokens`, inserts one example turn into the request, and retries requests that Cerebras's queue rejected or held for more than 8 s before any output. Responses, `usage` and `time_info` pass through unchanged |
+| same file, provider | Registers as the runtime owner of the `cerebras` provider in place of the bundled Cerebras plugin, to wrap its stream function. The wrapper sets `tool_choice` and `max_completion_tokens`, inserts two example turns into the request, and retries requests that Cerebras's queue rejected or held for more than 8 s before any output. Responses, `usage` and `time_info` pass through unchanged |
 
 ## What the recording adds
 

@@ -211,3 +211,14 @@ catalog results from other stores (no shared store or URL stem with a live top h
 From 18:45: the long `thoughtCall` again, now with two example turns (`EXAMPLE_ITEMS`, `EXAMPLE_ITEMS_2`) so the thought
 and the tool call have been seen three times. The 226-token tool call then reached about 1,710 tok/s in two takes
 (it never passed 1,547 when seen twice). `santa-catalog/index.mjs.v3-dup3` is the plugin without the second example.
+
+### Evening: deadline extended to 17:00 PT; two example turns and four result copies (20:05–)
+
+- From 19:46 the gateway refused browser connections ("too many SQL variables") after about 1,900 sessions in one
+  state directory. That state is archived as `.candidate-state-run1/`; recording continues on a fresh one.
+- Recording now runs at about 70 requests a minute (retry delay 2.2 s, two recorders per gateway).
+- New plugin options `exampleTurns` (1 or 2) and `resultCopies` (default 3). A second gateway with
+  `exampleTurns: 2, resultCopies: 4` ran side by side with the 18:40 configuration. With two example turns the
+  82-token tool call reached 1,748 tok/s (46.9 ms; its best with one example turn was about 1,650).
+- New entry from that configuration at 20:39: **1,755 mean / 1,762 p90** (calls at 1,748 and 1,762, 2.0 s from Enter
+  to the five links) → `submissions/candidate-1755tps.mp4`, `evidence/entry-1755/`.

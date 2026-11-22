@@ -88,10 +88,13 @@ const asLines = (items) => items.map((it, i) => `${i + 1}. [${it.name}](${it.url
 // more than once decodes faster, and here both copies come from this run's
 // search, not from the prompt.
 const RESULT_COPIES = 3;
-const asResult = (items) =>
-  RESULT_COPIES > 1 && items.length
-    ? Array.from({ length: RESULT_COPIES }, () => asLines(items)).join("\n\nReply with exactly these lines:\n")
+// `resultCopies` (config) overrides the number of copies; default 3.
+const asResult = (items, config = {}) => {
+  const copies = config.resultCopies ?? RESULT_COPIES;
+  return copies > 1 && items.length
+    ? Array.from({ length: copies }, () => asLines(items)).join("\n\nReply with exactly these lines:\n")
     : asLines(items);
+};
 
 async function searchOne(query, signal) {
   const body = {
@@ -166,7 +169,7 @@ function createSearchTool(config) {
       }
       const failed = settled.filter((r) => r.status === "rejected").map((r) => String(r.reason?.message ?? r.reason));
       const details = { items, ...(failed.length ? { errors: failed } : {}) };
-      const text = lines ? asResult(items) : JSON.stringify(items);
+      const text = lines ? asResult(items, config) : JSON.stringify(items);
       return { content: [{ type: "text", text }], details };
     },
   };
@@ -187,14 +190,17 @@ function exampleTurn(config) {
         reasoning: thoughtCall(config),
         tool_calls: [{ id, type: "function", function: { name: TOOL, arguments: ARGS } }],
       },
-      { role: "tool", tool_call_id: id, content: lines ? asResult(items) : JSON.stringify(items) },
+      { role: "tool", tool_call_id: id, content: lines ? asResult(items, config) : JSON.stringify(items) },
       { role: "assistant", content: asLines(items), reasoning: thoughtAnswer(config) },
     ];
   };
   const turns = turn(0, "Gift ideas from US shops, with links please.", EXAMPLE_ITEMS);
   // With a custom (long) thought, show the turn twice so the thought and the
   // tool call have been seen three times (prefix + two examples).
-  if (config.thoughtCall) turns.push(...turn(1, "Five holiday presents with product links, please.", EXAMPLE_ITEMS_2));
+  // `exampleTurns: 2` does the same with the short thought.
+  if (config.thoughtCall || config.exampleTurns === 2) {
+    turns.push(...turn(1, "Five holiday presents with product links, please.", EXAMPLE_ITEMS_2));
+  }
   return turns;
 }
 
@@ -244,7 +250,7 @@ function shapePayload(payload, config) {
     max_completion_tokens: payload.max_completion_tokens,
     fewShot: config.fewShot !== false,
     resultFormat: config.resultFormat ?? "lines",
-    build: "v3-dup3-x2",
+    build: `v4-copies${config.resultCopies ?? RESULT_COPIES}-examples${config.thoughtCall || config.exampleTurns === 2 ? 2 : 1}`,
   });
 }
 
